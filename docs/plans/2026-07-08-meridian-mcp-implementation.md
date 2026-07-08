@@ -31,7 +31,7 @@ risk tiers.
 ```
 src/config.ts               env schema (zod), fail-fast
 src/logger.ts               pino
-src/db/schema.ts            drizzle tables (operators, customers, accounts, transactions, cards, payees, transfers, disputes, audit_log)
+src/db/schema.ts            drizzle tables — business: operators, customers, accounts, transactions, cards, payees, transfers, disputes, audit_log; AS: auth_codes, refresh_tokens, login_sessions
 src/db/client.ts            pg Pool + drizzle instance + close()
 src/db/migrate.ts           run drizzle migrations programmatically
 src/db/seed.ts              faker fixed-seed dataset (+ operators w/ known dev passwords)
@@ -88,16 +88,16 @@ Per-tool insufficient scope → **MCP tool error** (`isError:true`) inside dispa
 
 ### Task 0 — Scaffolding & config
 - [ ] `npm init`, install deps, `tsconfig.json` (NodeNext, strict), `vitest.config.ts`, `.dockerignore`, `.env.example`.
-- [ ] `src/config.ts`: zod-validated env (`PORT, DATABASE_URL, PUBLIC_URL, AUTH_ISSUER, AUTH_SIGNING_KEY?, OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_CLIENT_REDIRECT_URIS, SEED_ON_BOOT, LOG_LEVEL, NODE_ENV, RATE_LIMIT_*`), fail-fast. Test: invalid env throws.
+- [ ] `src/config.ts`: zod-validated env (`PORT, DATABASE_URL, PUBLIC_URL, AUTH_ISSUER, AUTH_SIGNING_KEY?, COOKIE_SECRET, OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_CLIENT_REDIRECT_URIS, SEED_ON_BOOT, LOG_LEVEL, NODE_ENV, RATE_LIMIT_*`), fail-fast. Test: invalid env throws. (`COOKIE_SECRET` signs the login-session cookie.)
 - [ ] `src/logger.ts` pino. Commit.
 
 ### Task 1 — DB schema, client, migrations, seed
-- [ ] `db/schema.ts` all tables (spec §4), money = `bigint` cents. Test: schema imports, types compile.
-- [ ] `db/client.ts` Pool + drizzle + `closeDb()`. `drizzle.config.ts`. Generate migrations (`drizzle-kit generate`). `db/migrate.ts`.
+- [ ] `db/schema.ts` all business tables (spec §4) **plus the AS tables** `auth_codes` (client_id, code_hash, pkce_challenge, resource, scope, operator_sub, redirect_uri, expires_at, used), `refresh_tokens` (token_hash, client_id, sub, scope, resource, rotated_from, expires_at, revoked), `login_sessions` (id, operator_id, expires_at) — so all land in the single migration. Money = `bigint` cents. Test: schema imports, types compile.
+- [ ] `db/client.ts` Pool + drizzle + `closeDb()` (name used everywhere). `drizzle.config.ts`. Generate migrations (`drizzle-kit generate`). `db/migrate.ts`.
 - [ ] `db/seed.ts` fixed-seed faker (3 operators w/ known dev passwords hashed via argon2; ~300 customers; accounts; ~8k txns; cards; payees; disputes). Test (against docker PG): migrate+seed → row counts > 0, no negative balances. Commit.
 
 ### Task 2 — Auth core (scopes, keys, JWT)
-- [ ] `auth/scopes.ts` SCOPES + TOOL_SCOPES for every tool in spec §5. Test: every registered tool has an entry.
+- [ ] `auth/scopes.ts` SCOPES + TOOL_SCOPES for every tool in spec §5. Test (static, no registry yet): every TOOL_SCOPES key is in the known tool-name list and every value ⊆ SCOPES. (The converse "every registered tool has a scope entry" is asserted in Task 7/9.)
 - [ ] `auth/authserver/keys.ts` Ed25519 via jose (`generateKeyPair('EdDSA')` / import from `AUTH_SIGNING_KEY` JWK); export public JWK w/ `kid`. Warn if generated.
 - [ ] `auth/jwt.ts` `signAccessToken(claims)` + `verifyAccessToken`. Tests: round-trip; wrong audience → throws; expired → throws; bad sig → throws. Commit.
 
@@ -120,17 +120,18 @@ Per-tool insufficient scope → **MCP tool error** (`isError:true`) inside dispa
 
 ### Task 5 — MCP server wiring
 - [ ] `mcp/server.ts`: build `McpServer`, mount `StreamableHTTPServerTransport` (stateless JSON mode) on `POST/GET/DELETE /mcp` behind `requireBearer`. A `registerGuardedTool(name, schema, handler)` helper checks `TOOL_SCOPES[name] ⊆ req scopes` else returns MCP tool error; injects `ToolCtx`.
-- [ ] Test: unauthed /mcp → 401; authed `initialize` handshake works; a read tool with sufficient scope returns; same tool with under-scoped token → `isError` tool result (not 403). Commit.
+- [ ] Register a **test-only stub tool** (`__ping`, scope `banking:read`) so Task 5 is self-testable before real tools exist (remove or keep behind a test flag).
+- [ ] Test: unauthed /mcp → 401; authed `initialize` handshake works; `__ping` with sufficient scope returns; `__ping` with under-scoped token → `isError` tool result (not 403). Commit.
 - [ ] **Pin exact SDK API from installed `node_modules/@modelcontextprotocol/sdk` types before writing** (McpServer / StreamableHTTPServerTransport / registerTool signatures).
 
 ### Task 6 — Domain logic
-- [ ] `domain/errors.ts`, `domain/audit.ts` (`writeAudit`).
+- [ ] `domain/errors.ts`, `domain/audit.ts` (`writeAudit`). (`db/repo/*.ts`, `domain/disputes.ts`, `domain/kyc.ts` are leaf modules built as-needed within Tasks 6–7 — not forgotten.)
 - [ ] `domain/transfers.ts` `executeTransfer({fromAccountId, to, rail, amountCents, memo, idempotencyKey, actor})`: single DB txn — `SELECT … FOR UPDATE` source; reject non-active/insufficient/over-limit; idempotency_key unique → return prior; debit source, (internal) credit dest, insert transfer+transaction rows, writeAudit. 
 - [ ] Tests (money.spec): no negative balance; idempotency (same key twice → one effect, same result); frozen account rejected; concurrent transfers don't oversell (two parallel → one fails). Commit.
 
 ### Task 7 — Tools (per group, each: zod schema, scope via registerGuardedTool, audit on mutation)
 - [ ] `customers.ts` (search_customers, get_customer), `accounts.ts` (list_accounts, get_account, get_balance, list_transactions[cursor pagination], get_transaction), `cards.ts` (list_cards, freeze_card, unfreeze_card), `payees.ts` (create_payee), `payments.ts` (create_transfer, initiate_ach_payment, initiate_wire[needs both scopes]), `disputes.ts` (open_dispute), `admin.ts` (freeze_account, unfreeze_account, reverse_transaction, close_account, adjust_balance).
-- [ ] Per-group tests: happy path + input validation + scope rejection for one mutation. Commit per group.
+- [ ] Per-group tests: happy path + input validation + scope rejection for one mutation. **Explicit `initiate_wire` two-scope (AND) test:** a `payments:write`-only token → MCP tool error; `payments:write`+`wire:write` → success. Commit per group.
 
 ### Task 8 — HTTP app & boot
 - [ ] `http/health.ts` (`/healthz` 200; `/readyz` DB ping → 503 on fail).
@@ -151,6 +152,7 @@ Per-tool insufficient scope → **MCP tool error** (`isError:true`) inside dispa
 - [ ] `curl /healthz`, `curl /.well-known/oauth-protected-resource`, `curl /.well-known/oauth-authorization-server`.
 - [ ] `curl /mcp` (no token) → 401 + WWW-Authenticate.
 - [ ] `client_credentials` → mint token → MCP `initialize` + `tools/list` + a read tool call succeed; an admin tool with under-scoped token → MCP tool error.
+- [ ] **Full authorization_code + PKCE flow** end-to-end via a script: GET `/oauth/authorize`, POST login (seeded operator) + consent, capture `code`, POST `/oauth/token` with `code_verifier`+`resource`, then call a tool with the resulting operator token (proves the spec §1 headline flow, not just client_credentials).
 - [ ] A `create_transfer` moves money; balances update; second call w/ same idempotency_key is a no-op.
 - [ ] Capture outputs. Commit. Push to origin.
 
