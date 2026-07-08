@@ -191,13 +191,3 @@ export const refreshTokens = pgTable(
   },
   (t) => [index('refresh_sub_idx').on(t.sub)],
 );
-
-/** Short-lived operator login sessions referenced by a signed cookie. */
-export const loginSessions = pgTable('login_sessions', {
-  id: uuid('id').defaultRandom().primaryKey(),
-  operatorId: uuid('operator_id')
-    .notNull()
-    .references(() => operators.id),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-});

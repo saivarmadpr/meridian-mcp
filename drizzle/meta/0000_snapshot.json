@@ -1,5 +1,5 @@
 {
-  "id": "0a783675-b457-4980-992d-0412101059f5",
+  "id": "25fe8f1e-45ab-45f5-a11d-d06609c35015",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -511,59 +511,6 @@
           "tableTo": "transactions",
           "columnsFrom": [
             "transaction_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.login_sessions": {
-      "name": "login_sessions",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "operator_id": {
-          "name": "operator_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {
-        "login_sessions_operator_id_operators_id_fk": {
-          "name": "login_sessions_operator_id_operators_id_fk",
-          "tableFrom": "login_sessions",
-          "tableTo": "operators",
-          "columnsFrom": [
-            "operator_id"
           ],
           "columnsTo": [
             "id"
