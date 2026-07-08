@@ -81,7 +81,7 @@ client → GET /.well-known/oauth-protected-resource
   RS → { resource, authorization_servers:[ISSUER], scopes_supported, bearer_methods_supported:["header"] }
 client → GET ISSUER/.well-known/oauth-authorization-server
   AS → { issuer, authorization_endpoint, token_endpoint, jwks_uri, code_challenge_methods_supported:["S256"], … }
-client → /oauth/authorize?…&code_challenge=…&resource=https://<domain>/mcp  → consent → redirect(code)
+client → /oauth/authorize?…&code_challenge=…&resource=https://<domain>/mcp  → operator login → consent → redirect(code)
 client → POST /oauth/token (code + code_verifier + resource)  → access_token (JWT, aud=resource, scope=…) [+ refresh]
 client → POST /mcp (Authorization: Bearer <jwt>)  → RS validates iss/aud/exp/sig/scope → tool executes
 ```
@@ -121,8 +121,8 @@ MCP/
         metadata.ts           # RFC 8414 AS metadata + JWKS
         clients.ts            # pre-registered client(s), redirect-uri exact match
         keys.ts               # AS signing keypair (from env or generated on boot)
-        consent.ts            # minimal consent HTML page
-        store.ts              # auth codes (PKCE), refresh tokens (rotating) — Postgres-backed
+        consent.ts            # minimal operator login + consent HTML pages (login folds in here / router.ts)
+        store.ts              # auth codes (PKCE), refresh tokens (rotating), short-lived login session (signed cookie) — Postgres-backed
     db/
       schema.ts               # drizzle table definitions
       client.ts               # pg Pool + drizzle instance
@@ -163,7 +163,7 @@ All money is integer **cents** (`bigint`), never floats. All ids are UUID. Times
 | `payees` | id, customer_id→customers, name, account_number_masked, routing_masked, rail(`ach\|wire`), created_at |
 | `transfers` | id, from_account_id, to_account_id(nullable), to_payee_id(nullable), rail(`internal\|ach\|wire`), amount_cents, status(`pending\|settled\|failed\|reversed`), memo, idempotency_key(unique), created_at |
 | `disputes` | id, transaction_id→transactions, reason, status(`open\|investigating\|resolved\|denied`), created_at |
-| `audit_log` | id, actor(sub/client_id from token), action, target_type, target_id, metadata(jsonb), created_at |
+| `audit_log` | id, actor(= token `sub`), action, target_type, target_id, metadata(jsonb), created_at |
 
 Seed: ~3 operators (support/ops/admin, known dev passwords), ~300 customers, ~600 accounts,
 ~8k transactions, cards/payees/disputes, generated with `@faker-js/faker` using a **fixed
@@ -267,7 +267,9 @@ from this list (no drift):
   `client_credentials`. `client_credentials` is **in scope for this deliverable** because
   it is how headless clients get an audience-scoped token without a browser: the **test
   suite** uses it to mint tokens for tool tests, and machine clients (e.g. MCP Inspector in
-  M2M mode) use it directly; its `sub = client:<client_id>`. Access tokens are short-lived
+  M2M mode) use it directly; its `sub = client:<client_id>`. **Granted scopes = intersection
+  of the requested `scope` param and the client's allowed scopes** (so a test can mint a
+  deliberately under-scoped token to prove per-tool rejection). Access tokens are short-lived
   JWTs (`aud` = requested resource, `scope`, `sub`, `iss`, `exp`, `jti`). HTTPS-only in prod;
   redirect URIs localhost or HTTPS.
 - **Clients:** at least one pre-registered client (`meridian-copilot`) with fixed redirect
