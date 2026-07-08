@@ -155,6 +155,7 @@ All money is integer **cents** (`bigint`), never floats. All ids are UUID. Times
 
 | Table | Key columns |
 |---|---|
+| `operators` | id, username(unique), password_hash(argon2/bcrypt), display_name, role(`support\|ops\|admin`), created_at — the bank's internal staff who log in at the AS |
 | `customers` | id, full_name, email, phone, dob, ssn_last4, kyc_status(`unverified\|pending\|verified\|rejected`), risk_rating(`low\|medium\|high`), created_at |
 | `accounts` | id, customer_id→customers, type(`checking\|savings\|credit`), currency(`USD`), balance_cents, status(`active\|frozen\|closed`), opened_at |
 | `transactions` | id, account_id→accounts, direction(`debit\|credit`), amount_cents, counterparty, description, status(`pending\|posted\|reversed`), created_at |
@@ -164,8 +165,16 @@ All money is integer **cents** (`bigint`), never floats. All ids are UUID. Times
 | `disputes` | id, transaction_id→transactions, reason, status(`open\|investigating\|resolved\|denied`), created_at |
 | `audit_log` | id, actor(sub/client_id from token), action, target_type, target_id, metadata(jsonb), created_at |
 
-Seed: ~300 customers, ~600 accounts, ~8k transactions, cards/payees/disputes, generated
-with `@faker-js/faker` using a **fixed seed** for reproducibility.
+Seed: ~3 operators (support/ops/admin, known dev passwords), ~300 customers, ~600 accounts,
+~8k transactions, cards/payees/disputes, generated with `@faker-js/faker` using a **fixed
+seed** for reproducibility.
+
+### Identity & the `sub` claim
+The token's `sub` identifies the acting principal and is what `audit_log.actor` records:
+- **authorization_code flow** → an **operator** authenticated at the AS login; `sub = "operator:<operator_id>"`, and `act`/`operator_role` may carry the operator's role.
+- **client_credentials flow** (machine clients, test suite, later Shield proxy) → no human; `sub = "client:<client_id>"`.
+
+There is **no customer-facing login** — customers are *data*, operators are the *users*.
 
 ---
 
@@ -195,10 +204,19 @@ write `audit_log`; errors returned as MCP tool errors (`isError: true`) with saf
 | `close_account` | account_id, reason | critical | `admin:write` |
 | `adjust_balance` | account_id, amount_cents(±), reason | critical | `admin:write` |
 
-**Scope enforcement:** `scopes.ts` maps each tool → required scope(s). The RS checks the
-token's granted scopes before dispatch; insufficient → `403 insufficient_scope` at the
-HTTP layer where applicable, and a tool-level error otherwise. `initiate_wire` requiring
-**two** scopes exercises step-up/insufficient-scope handling.
+**Scope enforcement mechanism (decided).** Streamable HTTP multiplexes every tool call
+over one `POST /mcp`, so the HTTP layer cannot know which tool — and thus which scope — is
+required until it parses the JSON-RPC body. Therefore:
+- **Token-level failures** (missing / invalid signature / wrong audience / expired) are
+  enforced at the **HTTP layer** → `401` + `WWW-Authenticate` challenge (§6.1). This is the
+  RFC 9728 discovery trigger and applies before any tool runs.
+- **Per-tool insufficient scope** is enforced inside **tool dispatch** and surfaced as an
+  **MCP tool error** (`isError: true`) with a clear message naming the required scope(s) —
+  *not* an HTTP 403 (an HTTP-level per-tool 403 is impractical under multiplexing). This is
+  a deliberate, documented deviation from the spec's SHOULD-level runtime `403
+  insufficient_scope`, justified by the transport. `initiate_wire` requiring **both**
+  `payments:write` and `wire:write` is the canonical two-scope case (present-both-or-error;
+  no re-authorization/step-up flow is implemented).
 
 **Money-movement semantics (`create_transfer`/ACH/wire):** inside a single DB transaction —
 `SELECT … FOR UPDATE` the source account; reject if `status != active`, insufficient funds,
@@ -213,6 +231,11 @@ atomic.
 
 Target spec: **MCP 2025-11-25 authorization** (OAuth 2.1 subset).
 
+### 6.0 Canonical scopes (single source of truth)
+`scopes.ts` defines exactly these; `scopes_supported` in both RS and AS metadata is derived
+from this list (no drift):
+`banking:read`, `banking:write`, `payments:write`, `wire:write`, `admin:write`.
+
 ### 6.1 Resource server (MUST)
 - **RFC 9728 metadata** at `GET /.well-known/oauth-protected-resource` (and the
   path-scoped variant `/.well-known/oauth-protected-resource/mcp`): returns `resource`
@@ -222,9 +245,9 @@ Target spec: **MCP 2025-11-25 authorization** (OAuth 2.1 subset).
   `401` + `WWW-Authenticate: Bearer resource_metadata="<abs url>", scope="<scopes>"`.
 - **Token validation:** verify JWT signature against AS JWKS; check `iss == ISSUER`,
   `aud == resource` (RFC 8707 audience binding — reject tokens not minted for us),
-  `exp`/`nbf`. Invalid/expired → 401.
-- **Scope:** per-tool required scope; insufficient → `403` +
-  `WWW-Authenticate: Bearer error="insufficient_scope", scope="<needed>", resource_metadata="…"`.
+  `exp`/`nbf`. Invalid/expired/missing → 401 (the challenge above).
+- **Scope:** per-tool required scope is checked in tool dispatch and returned as an **MCP
+  tool error** on failure (see §5 "Scope enforcement mechanism"), not an HTTP 403.
 - **No token passthrough:** the client's token is never forwarded to any upstream.
 
 ### 6.2 Authorization server (MUST/SHOULD, minimal)
@@ -233,17 +256,23 @@ Target spec: **MCP 2025-11-25 authorization** (OAuth 2.1 subset).
   `authorization_endpoint`, `token_endpoint`, `jwks_uri`, `grant_types_supported`
   (`authorization_code`, `refresh_token`, `client_credentials`),
   `scopes_supported`, `response_types_supported:["code"]`.
-- **JWKS** at `/oauth/jwks` (public key; EdDSA/Ed25519 or RS256 — decide at impl, likely
-  Ed25519 via jose to mirror Shield).
-- **/authorize:** authorization_code + **PKCE S256 required**; **exact** redirect-uri match
-  against the pre-registered client; renders a minimal consent page; binds the `resource`
-  parameter into the issued token's `aud`.
-- **/token:** code→token exchange (verifies PKCE), `refresh_token` (rotating),
-  `client_credentials` (for machine clients / later Shield-proxy use). Access tokens are
-  short-lived JWTs (`aud` = requested resource, `scope`, `sub`, `iss`, `exp`). HTTPS-only in
-  prod; redirect URIs localhost or HTTPS.
-- **Clients:** at least one pre-registered client (`meridian-copilot`) with fixed
-  redirect URIs. Dynamic Client Registration (RFC 7591) is **optional/stretch**.
+- **JWKS** at `/oauth/jwks` (public key). Signing algorithm: **Ed25519 (EdDSA)** via `jose`,
+  to mirror Shield. (RS256 fallback only if a target MCP client rejects EdDSA — see §10;
+  that would change the `AUTH_SIGNING_KEY` format.)
+- **/authorize:** authorization_code + **PKCE S256 required**; **operator login** (username
+  + password against the `operators` table) followed by a minimal **consent** page; **exact**
+  redirect-uri match against the pre-registered client; binds the `resource` parameter into
+  the issued token's `aud` and the authenticated operator into `sub` (`operator:<id>`).
+- **/token:** code→token exchange (verifies PKCE), `refresh_token` (rotating), and
+  `client_credentials`. `client_credentials` is **in scope for this deliverable** because
+  it is how headless clients get an audience-scoped token without a browser: the **test
+  suite** uses it to mint tokens for tool tests, and machine clients (e.g. MCP Inspector in
+  M2M mode) use it directly; its `sub = client:<client_id>`. Access tokens are short-lived
+  JWTs (`aud` = requested resource, `scope`, `sub`, `iss`, `exp`, `jti`). HTTPS-only in prod;
+  redirect URIs localhost or HTTPS.
+- **Clients:** at least one pre-registered client (`meridian-copilot`) with fixed redirect
+  URIs and a client secret (for `client_credentials`). Dynamic Client Registration (RFC
+  7591) is **optional/stretch**, not required for success.
 
 ### 6.3 Later Shield swap (design hook, not built now)
 Setting `AUTH_ISSUER` to Shield's OAuth AS + disabling the local AS makes Meridian a pure
@@ -290,10 +319,13 @@ to make this a config change, not a code change.
 ## 9. Testing
 `vitest` + supertest against the express app, using a real Postgres (Railway test DB, a
 local docker pg, or `testcontainers`; decided at impl). Coverage:
-- **Auth spec:** 401 + `WWW-Authenticate` format; RFC 9728 metadata shape; RFC 8414 AS
-  metadata incl. `code_challenge_methods_supported`; audience rejection (token for another
-  resource → 401); `403 insufficient_scope` incl. the two-scope wire case; PKCE happy path
-  + PKCE-missing rejection; refresh rotation; redirect-uri exact-match rejection.
+- **Auth spec:** 401 + `WWW-Authenticate` format on unauthenticated `/mcp`; RFC 9728
+  metadata shape; RFC 8414 AS metadata incl. `code_challenge_methods_supported`; audience
+  rejection (token minted for another `resource` → 401); **per-tool insufficient scope
+  returns an MCP tool error** (`isError`), including the two-scope `initiate_wire` case;
+  PKCE happy path + PKCE-missing rejection; `client_credentials` token mint + tool call;
+  operator login required at `/authorize`; refresh rotation; redirect-uri exact-match
+  rejection.
 - **Tools:** representative behavior per group; PII fields present in reads.
 - **Money invariants:** no negative balance; idempotency (same key twice → one effect);
   frozen/closed-account rejection; atomic rollback on mid-transfer failure.
@@ -304,8 +336,9 @@ local docker pg, or `testcontainers`; decided at impl). Coverage:
 ## 10. Risks & open questions
 - **Test DB in CI/impl:** which Postgres for tests (testcontainers vs local docker vs a
   Railway branch DB) — resolve at plan time.
-- **AS signing algorithm:** Ed25519 (mirrors Shield, small) vs RS256 (broadest client
-  compat). Lean Ed25519; revisit if a target MCP client rejects EdDSA.
+- **AS signing algorithm (decided: Ed25519):** RS256 is the fallback *only* if a target MCP
+  client rejects EdDSA; that would change the `AUTH_SIGNING_KEY` JWK format. Not expected to
+  block.
 - **v1 SDK exact API surface** for auth helpers vs a hand-rolled express middleware —
   confirm from installed types; the design does not depend on any specific helper existing.
 - **Streamable HTTP session mode:** stateful (session id, SSE resumability) vs stateless
