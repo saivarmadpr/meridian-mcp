@@ -1,9 +1,10 @@
 import type { Express, Request, Response, NextFunction } from 'express';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { mcpAuthRouter, createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { meridianOAuthProvider, handleClientCredentials } from './provider.js';
 import { verifyPending, verifyOperator, renderLoginConsent, type PendingAuth } from './consent.js';
 import { createAuthCode } from './store.js';
 import { registeredClient } from './clients.js';
+import { getJwks } from './keys.js';
 import { config } from '../../config.js';
 import { SCOPES } from '../scopes.js';
 import { logger } from '../../logger.js';
@@ -66,6 +67,27 @@ export function mountAuthServer(app: Express): void {
     redirect.searchParams.set('code', code);
     if (params.state) redirect.searchParams.set('state', params.state);
     res.redirect(302, redirect.href);
+  });
+
+  // JWKS + augmented AS metadata (the SDK is key-agnostic and omits jwks_uri and
+  // the client_credentials grant we add). Registered BEFORE mcpAuthRouter so these
+  // shadow the SDK's default metadata route.
+  app.get('/jwks', async (_req: Request, res: Response) => {
+    res.json(await getJwks());
+  });
+  const asMetadata = {
+    ...createOAuthMetadata({
+      provider: meridianOAuthProvider,
+      issuerUrl: new URL(config.ISSUER),
+      baseUrl: new URL(config.PUBLIC_URL),
+      scopesSupported: [...SCOPES],
+    }),
+    jwks_uri: `${config.PUBLIC_URL}/jwks`,
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
+    token_endpoint_auth_methods_supported: ['client_secret_post'],
+  };
+  app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
+    res.json(asMetadata);
   });
 
   // Standard MCP authorization-server + protected-resource metadata & endpoints.

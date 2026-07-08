@@ -6,6 +6,7 @@ import type {
   OAuthTokens,
   OAuthTokenRevocationRequest,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { clientsStore, clientAllowedScopes } from './clients.js';
 import { renderLoginConsent } from './consent.js';
 import { signPending } from './consent.js';
@@ -103,7 +104,13 @@ export const meridianOAuthProvider: OAuthServerProvider = {
   },
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const claims = await verifyAccessToken(token);
+    let claims;
+    try {
+      claims = await verifyAccessToken(token);
+    } catch (err) {
+      // Map to the SDK error the bearer middleware translates into a 401.
+      throw new InvalidTokenError(err instanceof Error ? err.message : 'invalid token');
+    }
     return {
       token,
       clientId: claims.client_id,
